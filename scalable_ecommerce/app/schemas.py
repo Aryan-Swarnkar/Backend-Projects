@@ -69,3 +69,11 @@ class CategoryCreate(BaseModel):
 class AddToCartRequest(BaseModel):
     product_id: int
     quantity: int = Field(gt=0)
+
+
+class CartItemInput(BaseModel):
+    product_id: int
+    quantity: int = Field(gt=0)
+
+class BulkAddToCartRequest(BaseModel):
+    items: List[CartItemInput]

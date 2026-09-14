@@ -1,8 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.schemas import ProductResponse, ProductCreate, ProductWithCategoriesResponse, CategoryResponse, CategoryCreate, ProductUpdate, CartItemResponse, AddToCartRequest
-from app.models import Product, Category, CartItem, Cart
+from app.schemas import ProductResponse, ProductCreate, ProductWithCategoriesResponse, CategoryResponse, CategoryCreate, ProductUpdate, CartItemResponse, AddToCartRequest, CartItemInput, BulkAddToCartRequest
+from app.models import Product, Category, CartItem, Cart, Order, OrderItem
 from decimal import Decimal
 
 app = FastAPI()
@@ -47,7 +47,7 @@ def list_products(
     if min_price is not None:
         query = query.filter(Product.price >= min_price)
     if max_price is not None:
-        query = query.filter(Product.price <= min_price)
+        query = query.filter(Product.price <= max_price)
     if name is not None:
         query = query.filter(Product.name.ilike(f"%{name}%"))
     if in_stock is not None:
@@ -111,36 +111,61 @@ def add_category_to_product(product_id: int, category_id: int, db: Session = Dep
 def list_categories(db: Session = Depends(get_db)):
     return db.query(Category).all()
 
-@app.post("/add_to_cart", response_model=CartItemResponse)
-def add_to_cart(
-    request: AddToCartRequest,
-    user_id: int,
-    db: Session = Depends(get_db)
-):
+@app.post("/add_to_cart/bulk", response_model=CartItemResponse)
+def add_to_cart_bulk(request: BulkAddToCartRequest, user_id: int, db: Session = Depends(get_db)):
     cart = db.query(Cart).filter(Cart.user_id == user_id).first()
     if not cart:
         cart = Cart(user_id=user_id)
         db.add(cart)
-        db.commit()
-        db.refresh(cart)
+        db.flush()
 
-    existing_item = db.query(CartItem).filter(
-        CartItem.cart_id == cart.id,
-        CartItem.product_id == request.product_id
-    ).first()
+    for item in request.items:
+        existing_item = db.query(CartItem).filter(
+            CartItem.cart_id == cart.id,
+            CartItem.product_id == item.product_id
+        ).first()
 
-    if existing_item:
-        existing_item.quantity += request.quantity
-        db.commit()
-        db.refresh(existing_item)
-        return existing_item
-    
-    new_item = CartItem(
-        cart_id=cart.id,
-        product_id=request.product_id,
-        quantity=request.quantity
-    )
-    db.add(new_item)
+        if existing_item:
+            existing_item.quantity += item.quantity
+        else:
+            db.add(CartItem(cart_id=cart.id, product_id=item.product_id, quantity=item.quantity))
+
     db.commit()
-    db.refresh(new_item)
-    return new_item
+    db.refresh(cart)
+    return cart
+
+@app.post("/checkout", response_model=ProductResponse)
+def checkout(user_id: int, db: Session = Depends(get_db)):
+    cart = db.query(Cart).filter(Cart.user_id == user_id).first()
+    if not cart or not cart.items:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+
+    try:
+        order = Order(user_id=user_id)
+        db.add(order)
+        db.flush()  # <-- new piece, explained below
+
+        for item in cart.items:
+            product = db.query(Product).filter(Product.id == item.product_id).first()
+            if not product:
+                raise HTTPException(status_code=404, detail=f"Product {item.product_id} no longer exists")
+            if product.stock_quantity < item.quantity:
+                raise HTTPException(status_code=400, detail=f"Not enough stock for {product.name}")
+
+            order_item = OrderItem(
+                order_id=order.id,
+                product_id=product.id,
+                quantity=item.quantity,
+                price_at_purchase=product.price
+            )
+            db.add(order_item)
+            product.stock_quantity -= item.quantity
+            db.delete(item)
+
+        db.commit()
+        db.refresh(order)
+        return order
+
+    except Exception:
+        db.rollback()
+        raise
