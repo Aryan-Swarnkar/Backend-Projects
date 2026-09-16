@@ -6,11 +6,19 @@ from redis.asyncio import Redis
 from app.db.database import get_db
 from app.db.redis import get_redis
 
+from app.db.redis import redis_client
+from app.middleware.rate_limit import RateLimitMiddleware
+
 from app.api.v1.auth import router as auth_router
 from app.api.v1.urls import router as urls_router
 from app.api.redirect import router as redirect_router
 
 app = FastAPI(title="ShortLink API")
+
+app.add_middleware(
+    RateLimitMiddleware,
+    redis=redis_client,
+)
 
 app.include_router(
     auth_router,

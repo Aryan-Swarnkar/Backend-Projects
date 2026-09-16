@@ -1,61 +1,73 @@
-from dataclasses import dataclass
-from time import monotonic
-
-
-@dataclass
-class TokenBucket:
-    capacity: float
-    refill_rate: float
-    tokens: float
-    last_refill: float
-
-    @classmethod
-    def create(
-        cls,
-        capacity: float,
-        refill_rate: float,
-    ) -> "TokenBucket":
-        now = monotonic()
-
-        return cls(
-            capacity=capacity,
-            refill_rate=refill_rate,
-            tokens=capacity,
-            last_refill=now,
-        )
-
-    def refill(self) -> None:
-        now = monotonic()
-
-        elapsed = now - self.last_refill
-
-        self.tokens = min(
-            self.capacity,
-            self.tokens + elapsed * self.refill_rate,
-        )
-
-        self.last_refill = now
-
-    def consume(self, tokens: float = 1.0) -> bool:
-        self.refill()
-
-        if self.tokens < tokens:
-            return False
-
-        self.tokens -= tokens
-
-        return True
-    
-    
-
-import json 
+import json
 import time
 
 from redis.asyncio import Redis
 
+
 RATE_LIMIT_CAPACITY = 10.0
 RATE_LIMIT_REFILL_RATE = 1.0
 RATE_LIMIT_KEY_TTL = 60
+
+
+TOKEN_BUCKET_SCRIPT = """
+local key = KEYS[1]
+
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local requested = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+
+local state = redis.call("GET", key)
+
+local tokens
+local last_refill
+
+if state then
+    local decoded = cjson.decode(state)
+
+    tokens = tonumber(decoded["tokens"])
+    last_refill = tonumber(decoded["last_refill"])
+else
+    tokens = capacity
+    last_refill = now
+end
+
+local elapsed = now - last_refill
+
+tokens = math.min(
+    capacity,
+    tokens + elapsed * refill_rate
+)
+
+last_refill = now
+
+local allowed = 0
+
+if tokens >= requested then
+    tokens = tokens - requested
+    allowed = 1
+end
+
+local new_state = cjson.encode({
+    tokens = tokens,
+    last_refill = last_refill
+})
+
+redis.call(
+    "SET",
+    key,
+    new_state,
+    "EX",
+    ttl
+)
+
+return {
+    allowed,
+    tostring(tokens)
+}
+"""
+
 
 class RedisTokenBucket:
     def __init__(
@@ -67,52 +79,38 @@ class RedisTokenBucket:
         self.redis = redis
         self.capacity = capacity
         self.refill_rate = refill_rate
-        
+
+        self.script = redis.register_script(
+            TOKEN_BUCKET_SCRIPT
+        )
+
     def _build_key(self, identity: str) -> str:
         return f"rate_limit:user:{identity}"
-    
+
     async def consume(
         self,
         identity: str,
         tokens: float = 1.0,
     ) -> bool:
         key = self._build_key(identity)
-        
-        current = await self.redis.get(key)
-        
-        now = time.time()
-        
-        if current is None:
-            bucket = {
-                "tokens": self.capacity,
-                "last_refill": now,
-            }
-        else:
-            bucket = json.loads(current)
-            
-        elapsed = now - bucket["last_refill"]
-        
-        bucket["tokens"] = min(
-            self.capacity,
-            bucket["tokens"] + elapsed * self.refill_rate,
+
+        result = await self.script(
+            keys=[key],
+            args=[
+                self.capacity,
+                self.refill_rate,
+                time.time(),
+                tokens,
+                RATE_LIMIT_KEY_TTL,
+            ],
         )
 
-        bucket["last_refill"] = now
-        
-        if bucket["tokens"] < tokens:
-            await self.redis.set(
-                key,
-                json.dumps(bucket),
-                ex=RATE_LIMIT_KEY_TTL,
-            )
-            
-            return False
-        
-        bucket["tokens"] -= tokens
-        
-        await self.redis.set(
-            key,
-            json.dumps(bucket),
-            ex=RATE_LIMIT_KEY_TTL,
-        )
-        return True
+        allowed = int(result[0])
+
+        return allowed == 1
+    
+    
+def get_rate_limiter(
+    redis: Redis,
+) -> RedisTokenBucket:
+    return RedisTokenBucket(redis)

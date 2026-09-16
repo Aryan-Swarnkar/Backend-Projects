@@ -26,4 +26,23 @@ def create_access_token(user_id: int) -> str:
         settings.JWT_SECRET,
         algorithm=settings.JWT_ALGORITHM,
     )
+
+from jwt import InvalidTokenError
+
+def get_user_id_from_token(token: str) -> int | None:
+    try:
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET,
+            algorithms=[settings.JWT_ALGORITHM],
+        )
+        user_id = payload.get("sub")
+        
+        if user_id is None:
+            return None
+        
+        return int(user_id)
+    
+    except (InvalidTokenError, ValueError):
+        return None
     
