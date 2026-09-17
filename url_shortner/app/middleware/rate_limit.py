@@ -43,8 +43,8 @@ class RateLimitMiddleware:
             return
         
         try:
-            allowed = await self.limiter.consume(
-                str(user_id)
+            result = await self.limiter.consume(
+               str(user_id)
             )
             
         except Exception:
@@ -55,7 +55,7 @@ class RateLimitMiddleware:
                 },
             )(scope, receive, send)
         
-        if not allowed:
+        if not result.allowed:
             response = JSONResponse(
                 status_code=429,
                 content={
