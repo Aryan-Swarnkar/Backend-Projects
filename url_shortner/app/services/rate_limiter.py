@@ -1,12 +1,18 @@
 import json
 import time
+from app.core.config import settings
 
 from redis.asyncio import Redis
 
+from dataclasses import dataclass
+import math
 
-RATE_LIMIT_CAPACITY = 10.0
-RATE_LIMIT_REFILL_RATE = 1.0
-RATE_LIMIT_KEY_TTL = 60
+
+@dataclass
+class RateLimitResult:
+    allowed: bool
+    remaining_tokens: float
+    retry_after: int
 
 
 TOKEN_BUCKET_SCRIPT = """
@@ -62,9 +68,18 @@ redis.call(
     ttl
 )
 
+local retry_after = 0
+
+if allowed == 0 then
+    retry_after = math.ceil(
+        (requested - tokens) / refill_rate
+    )
+end
+
 return {
     allowed,
-    tostring(tokens)
+    tostring(tokens),
+    retry_after
 }
 """
 
@@ -73,12 +88,20 @@ class RedisTokenBucket:
     def __init__(
         self,
         redis: Redis,
-        capacity: float = RATE_LIMIT_CAPACITY,
-        refill_rate: float = RATE_LIMIT_REFILL_RATE,
+        capacity: float | None = None,
+        refill_rate: float | None = None,
     ):
         self.redis = redis
-        self.capacity = capacity
-        self.refill_rate = refill_rate
+        self.capacity = (
+            capacity
+            if capacity is not None
+            else settings.RATE_LIMIT_CAPACITY
+        )
+        self.refill_rate = (
+            refill_rate
+            if refill_rate is not None
+            else settings.RATE_LIMIT_REFILL_RATE
+        )
 
         self.script = redis.register_script(
             TOKEN_BUCKET_SCRIPT
@@ -91,7 +114,7 @@ class RedisTokenBucket:
         self,
         identity: str,
         tokens: float = 1.0,
-    ) -> bool:
+    ) -> RateLimitResult:
         key = self._build_key(identity)
 
         result = await self.script(
@@ -101,13 +124,18 @@ class RedisTokenBucket:
                 self.refill_rate,
                 time.time(),
                 tokens,
-                RATE_LIMIT_KEY_TTL,
+                settings.RATE_LIMIT_KEY_TTL
             ],
         )
-
         allowed = int(result[0])
-
-        return allowed == 1
+        remaining_tokens = float(result[1])
+        retry_after = int(result[2])
+        
+        return RateLimitResult(
+            allowed=allowed == 1,
+            remaining_tokens=remaining_tokens,
+            retry_after=retry_after,
+        )
     
     
 def get_rate_limiter(
