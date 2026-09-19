@@ -1,75 +1,97 @@
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.security import get_user_id_from_token
 from app.services.rate_limiter import RedisTokenBucket
 
-class RateLimitMiddleware:
-    def __init__(self, app, redis: Redis):
-        self.app = app
+import math
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(
+        self,
+        app,
+        redis: Redis,
+    ):
+        super().__init__(app)
+
         self.limiter = RedisTokenBucket(redis)
-        
-    async def __call__(self, scope, receive, send,):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        
-        request = Request(scope, receive=receive)
-        
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next,
+    ):
         if (
             request.method != "POST"
             or request.url.path != "/api/v1/urls"
         ):
-            await self.app(scope, receive, send)
-            return
-        
-        authorization = request.headers.get("Authorization")
-        
+            return await call_next(request)
+
+        authorization = request.headers.get(
+            "Authorization"
+        )
+
         if not authorization:
-            await self.app(scope, receive, send)
-            return
-        
+            return await call_next(request)
+
         scheme, _, token = authorization.partition(" ")
-        
-        if scheme.lower() != "bearer" or not token:
-            await self.app(scope, receive, send)
-            return 
+
+        if (
+            scheme.lower() != "bearer"
+            or not token
+        ):
+            return await call_next(request)
 
         user_id = get_user_id_from_token(token)
-        
+
         if user_id is None:
-            await self.app(scope, receive, send)
-            return
-        
+            return await call_next(request)
+
         try:
             result = await self.limiter.consume(
-               str(user_id)
+                str(user_id)
             )
-            
+
         except Exception:
-            return await JSONResponse(
+            return JSONResponse(
                 status_code=503,
                 content={
-                    "detail": "Rate limiting service unavailable",
-                },
-            )(scope, receive, send)
-        
-        if not result.allowed:
-            response = JSONResponse(
-                status_code=429,
-                content={
-                    "detail": "Rate limit exceeded.",
-                },
-                headers={
-                    "Retry-after": "1",
+                    "detail": (
+                        "Rate limiting service unavailable"
+                    ),
                 },
             )
-            
-            await response(scope, receive, send)
-            return 
-        
-        await self.app(scope, receive, send)
-        
-        
-        
+
+        if not result.allowed:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": "Rate limit exceeded",
+                },
+                headers={
+                    "Retry-After": str(
+                        result.retry_after
+                    ),
+                    "X-RateLimit-Limit": str(
+                        int(self.limiter.capacity)
+                    ),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+
+        response = await call_next(request)
+
+        response.headers["X-RateLimit-Limit"] = str(
+            int(self.limiter.capacity)
+        )
+
+        response.headers["X-RateLimit-Remaining"] = str(
+            max(
+                0,
+                math.floor(result.remaining_tokens),
+            )
+        )
+
+        return response
